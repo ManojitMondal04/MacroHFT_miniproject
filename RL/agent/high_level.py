@@ -1,601 +1,314 @@
-import pathlib
-import sys
-import random
-import argparse
-
+import os
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import yaml
-import os
-import joblib
-from torch.utils.tensorboard import SummaryWriter
+import torch.optim as optim
+import random
+from collections import deque
+import matplotlib.pyplot as plt
 import warnings
+from datetime import datetime
 warnings.filterwarnings("ignore")
 
-ROOT = str(pathlib.Path(__file__).resolve().parents[3])
-sys.path.append(ROOT)
-sys.path.insert(0, ".")
+# Suppress TensorFlow/CUDA warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-from MacroHFT.model.net import *
-from MacroHFT.env.high_level_env import Testing_Env, Training_Env
-from MacroHFT.RL.util.utili import get_ada, get_epsilon, LinearDecaySchedule
-from MacroHFT.RL.util.replay_buffer import ReplayBuffer_High
-from MacroHFT.RL.util.memory import episodicmemory
+# ====================== Configuration ======================
+class Config:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seed = 42
+    lr = 0.0001  # Reduced learning rate
+    batch_size = 64
+    gamma = 0.99
+    epsilon_start = 1.0
+    epsilon_end = 0.01
+    epsilon_decay = 0.999  # Slower epsilon decay
+    target_update = 10
+    memory_size = 10000
+    num_episodes = 500
+    
+    # Data paths
+    train_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_train.csv"
+    val_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_validate.csv"
+    test_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_test.csv"
+    
+    # Dataset limitation
+    max_train_rows = 10000  # Smaller dataset for testing
+    max_val_rows = 2000
+    
+    tech_indicators = ['Open', 'High', 'Low', 'Close', 'Volume']
 
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["F_ENABLE_ONEDNN_OPTS"] = "0"
+# Set random seeds
+torch.manual_seed(Config.seed)
+np.random.seed(Config.seed)
+random.seed(Config.seed)
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--buffer_size",type=int,default=1000000,)
-parser.add_argument("--dataset",type=str,default="ETHUSDT")
-parser.add_argument("--q_value_memorize_freq",type=int, default=10,)
-parser.add_argument("--batch_size",type=int,default=512)
-parser.add_argument("--eval_update_freq",type=int,default=512)
-parser.add_argument("--lr", type=float, default=1e-4)
-parser.add_argument("--epsilon_start",type=float,default=0.7)
-parser.add_argument("--epsilon_end",type=float,default=0.3)
-parser.add_argument("--decay_length",type=int,default=5)
-parser.add_argument("--update_times",type=int,default=10)
-parser.add_argument("--gamma", type=float, default=0.99)
-parser.add_argument("--tau", type=float, default=0.005)
-parser.add_argument("--transcation_cost",type=float,default=0.2 / 1000)
-parser.add_argument("--back_time_length",type=int,default=1)
-parser.add_argument("--seed",type=int,default=12345)
-parser.add_argument("--n_step",type=int,default=1)
-parser.add_argument("--epoch_number",type=int,default=15)
-parser.add_argument("--device",type=str,default="cuda:0")
-parser.add_argument("--alpha",type=float,default=0.5)
-parser.add_argument("--beta",type=int,default=5)
-parser.add_argument("--exp",type=str,default="exp1")
-parser.add_argument("--num_step",type=int,default=10)
-
-
-def seed_torch(seed):
-    random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-
-
-class DQN(object):
-    def __init__(self, args):  # 定义DQN的一系列属性
-        self.seed = args.seed
-        seed_torch(self.seed)
-        if torch.cuda.is_available():
-            self.device = torch.device(args.device)
-        else:
-            self.device = torch.device("cpu")
-        self.result_path = os.path.join("./result/high_level", '{}'.format(args.dataset), args.exp)
-        self.model_path = os.path.join(self.result_path,
-                                       "seed_{}".format(self.seed))
-        self.train_data_path = os.path.join(ROOT, "MacroHFT",
-                                        "data", args.dataset, "whole")
-        self.val_data_path = os.path.join(ROOT, "MacroHFT",
-                                        "data", args.dataset, "whole")
-        self.test_data_path = os.path.join(ROOT, "MacroHFT",
-                                        "data", args.dataset, "whole")
-        self.dataset=args.dataset
-        self.num_step = args.num_step
-        if "BTC" in self.dataset:
-            self.max_holding_number=0.01
-        elif "ETH" in self.dataset:
-            self.max_holding_number=0.2
-        elif "DOT" in self.dataset:
-            self.max_holding_number=10
-        elif "LTC" in self.dataset:
-            self.max_holding_number=10
-        else:
-            raise Exception ("we do not support other dataset yet")
-        self.epoch_number = args.epoch_number
-        
-        self.log_path = os.path.join(self.model_path, "log")
-        if not os.path.exists(self.log_path):
-            os.makedirs(self.log_path)
-        self.writer = SummaryWriter(self.log_path)
-        self.update_counter = 0
-        self.q_value_memorize_freq = args.q_value_memorize_freq
-
-        if not os.path.exists(self.model_path):
-            os.makedirs(self.model_path)
-
-        self.tech_indicator_list = np.load('./data/feature_list/single_features.npy', allow_pickle=True).tolist()
-        self.tech_indicator_list_trend = np.load('./data/feature_list/trend_features.npy', allow_pickle=True).tolist()
-        self.clf_list = ['slope_360', 'vol_360']
-
-        self.transcation_cost = args.transcation_cost
-        self.back_time_length = args.back_time_length
-        self.n_action = 2
-        self.n_state_1 = len(self.tech_indicator_list)
-        self.n_state_2 = len(self.tech_indicator_list_trend)
-        self.slope_1 = subagent(
-            self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)
-        self.slope_2 = subagent(
-            self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)
-        self.slope_3 = subagent(
-            self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)
-        self.vol_1 = subagent(
-            self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)
-        self.vol_2 = subagent(
-            self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)
-        self.vol_3 = subagent(
-            self.n_state_1, self.n_state_2, self.n_action, 64).to(self.device)        
-        model_list_slope = [
-            "./result/low_level/ETHUSDT/best_model/slope/1/best_model.pkl", 
-            "./result/low_level/ETHUSDT/best_model/slope/2/best_model.pkl",
-            "./result/low_level/ETHUSDT/best_model/slope/3/best_model.pkl"
-        ]
-        model_list_vol = [
-            "./result/low_level/ETHUSDT/best_model/vol/1/best_model.pkl",
-            "./result/low_level/ETHUSDT/best_model/vol/2/best_model.pkl",
-            "./result/low_level/ETHUSDT/best_model/vol/3/best_model.pkl"
-        ]
-        self.slope_1.load_state_dict(
-            torch.load(model_list_slope[0], map_location=self.device))
-        self.slope_2.load_state_dict(
-            torch.load(model_list_slope[1], map_location=self.device))
-        self.slope_3.load_state_dict(
-            torch.load(model_list_slope[2], map_location=self.device))
-        self.vol_1.load_state_dict(
-            torch.load(model_list_vol[0], map_location=self.device))
-        self.vol_2.load_state_dict(
-            torch.load(model_list_vol[1], map_location=self.device))
-        self.vol_3.load_state_dict(
-            torch.load(model_list_vol[2], map_location=self.device))
-        self.slope_1.eval()
-        self.slope_2.eval()
-        self.slope_3.eval()
-        self.vol_1.eval()
-        self.vol_2.eval()
-        self.vol_3.eval()
-        self.slope_agents = {
-            0: self.slope_1,
-            1: self.slope_2,
-            2: self.slope_3
-        }
-        self.vol_agents = {
-            0: self.vol_1,
-            1: self.vol_2,
-            2: self.vol_3
-        }
-        self.hyperagent = hyperagent(self.n_state_1, self.n_state_2, self.n_action, 32).to(self.device)
-        self.hyperagent_target = hyperagent(self.n_state_1, self.n_state_2, self.n_action, 32).to(self.device)
-        self.hyperagent_target.load_state_dict(self.hyperagent.state_dict())
-        self.update_times = args.update_times
-        self.optimizer = torch.optim.Adam(self.hyperagent.parameters(),
-                                          lr=args.lr)
-        self.loss_func = nn.MSELoss()
-        self.batch_size = args.batch_size
-        self.gamma = args.gamma
-        self.tau = args.tau
-        self.n_step = args.n_step
-        self.eval_update_freq = args.eval_update_freq
-        self.buffer_size = args.buffer_size
-        self.epsilon_start = args.epsilon_start
-        self.epsilon_end = args.epsilon_end
-        self.decay_length = args.decay_length
-        self.epsilon_scheduler = LinearDecaySchedule(start_epsilon=self.epsilon_start, end_epsilon=self.epsilon_end, decay_length=self.decay_length)
-        self.epsilon = args.epsilon_start
-        self.memory = episodicmemory(4320, 5, self.n_state_1, self.n_state_2, 64, self.device)
-
-    def calculate_q(self, w, qs):
-        q_tensor = torch.stack(qs)
-        q_tensor = q_tensor.permute(1, 0, 2)
-        weights_reshaped = w.view(-1, 1, 6)
-        combined_q = torch.bmm(weights_reshaped, q_tensor).squeeze(1)
-        
-        return combined_q
-
-
-    def update(self, replay_buffer):
-        batch, _, _ = replay_buffer.sample()
-        batch = {k: v.to(self.device) for k, v in batch.items()}
-        
-        w_current = self.hyperagent(batch['state'], batch['state_trend'], batch['state_clf'], batch['previous_action'])
-        w_next = self.hyperagent_target(batch['next_state'], batch['next_state_trend'], batch['next_state_clf'], batch['next_previous_action'])
-        w_next_ = self.hyperagent(batch['next_state'], batch['next_state_trend'], batch['next_state_clf'], batch['next_previous_action'])
-
-
-        qs_current = [
-                    self.slope_agents[0](batch['state'], batch['state_trend'], batch['previous_action']),
-                    self.slope_agents[1](batch['state'], batch['state_trend'], batch['previous_action']),
-                    self.slope_agents[2](batch['state'], batch['state_trend'], batch['previous_action']),
-                    self.vol_agents[0](batch['state'], batch['state_trend'], batch['previous_action']),
-                    self.vol_agents[1](batch['state'], batch['state_trend'], batch['previous_action']),
-                    self.vol_agents[2](batch['state'], batch['state_trend'], batch['previous_action'])
-        ]
-        qs_next = [
-                    self.slope_agents[0](batch['next_state'], batch['next_state_trend'], batch['next_previous_action']),
-                    self.slope_agents[1](batch['next_state'], batch['next_state_trend'], batch['next_previous_action']),
-                    self.slope_agents[2](batch['next_state'], batch['next_state_trend'], batch['next_previous_action']),
-                    self.vol_agents[0](batch['next_state'], batch['next_state_trend'], batch['next_previous_action']),
-                    self.vol_agents[1](batch['next_state'], batch['next_state_trend'], batch['next_previous_action']),
-                    self.vol_agents[2](batch['next_state'], batch['next_state_trend'], batch['next_previous_action'])
-        ]
-        q_distribution = self.calculate_q(w_current, qs_current)
-        q_current = q_distribution.gather(-1, batch['action']).squeeze(-1)
-        a_argmax = self.calculate_q(w_next_, qs_next).argmax(dim=-1, keepdim=True)
-        q_nexts = self.calculate_q(w_next, qs_next)
-        q_target = batch['reward'] + self.gamma * (1 - batch['terminal']) * q_nexts.gather(-1, a_argmax).squeeze(-1)
-
-        td_error = self.loss_func(q_current, q_target)
-        memory_error = self.loss_func(q_current, batch['q_memory'])
-
-        demonstration = batch['demo_action']
-        KL_loss = F.kl_div(
-            (q_distribution.softmax(dim=-1) + 1e-8).log(),
-            (demonstration.softmax(dim=-1) + 1e-8),
-            reduction="batchmean",
+# ====================== Neural Network ======================
+class DQN(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(DQN, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.BatchNorm1d(128),  # Added batch norm
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.BatchNorm1d(128),  # Added batch norm
+            nn.ReLU(),
+            nn.Linear(128, output_dim)
         )
+    
+    def forward(self, x):
+        return self.net(x)
 
-        loss = td_error + args.alpha * memory_error + args.beta * KL_loss
+# ====================== Trading Environment ======================
+class TradingEnv:
+    def __init__(self, df, initial_balance=10000, transaction_cost=0.0002):
+        print("\n" + "="*50)
+        print("Debug: Initializing environment...")
+        print(f"Raw data shape: {df.shape}")
+        
+        # Data preprocessing with validation
+        self.df = df[Config.tech_indicators].copy()
+        self.df = self.df.apply(pd.to_numeric, errors='coerce').dropna()
+        
+        # Data validation
+        assert not self.df.isnull().values.any(), "NaN values detected in data"
+        assert (self.df['Close'] > 0).all(), "Zero/negative prices found"
+        
+        print(f"Clean data shape: {self.df.shape}")
+        print("Sample data points:")
+        print(self.df.head(2))
+        
+        self.initial_balance = initial_balance
+        self.transaction_cost = transaction_cost
+        self.action_space = [0, 1]
+        self.reset()
+        print("Environment initialized successfully!")
+        print("="*50 + "\n")
+        
+    def reset(self):
+        self.current_step = 0
+        self.balance = self.initial_balance
+        self.holding = 0
+        self.portfolio_value = [self.initial_balance]
+        return self._get_state()
+    
+    def _get_state(self):
+        state = self.df.iloc[self.current_step].values.astype(np.float32)
+        return torch.FloatTensor(state).to(Config.device)
+    
+    def step(self, action):
+        if self.current_step >= len(self.df) - 1:
+            return self._get_state(), 0, True, {}
+            
+        current_price = self.df.iloc[self.current_step]['Close']
+        next_price = self.df.iloc[self.current_step + 1]['Close']
+        
+        # Execute action with safeguards
+        if action == 1 and self.holding == 0:
+            cost = max(current_price * (1 + self.transaction_cost), 1e-6)
+            self.holding = min(self.balance / cost, 1e6)  # Prevent extreme values
+            self.balance = 0
+        
+        elif action == 0 and self.holding > 0:
+            proceeds = max(self.holding * current_price * (1 - self.transaction_cost), 0)
+            self.balance = proceeds
+            self.holding = 0
+        
+        # Calculate reward with numerical safeguards
+        new_value = max(self.balance + (self.holding * next_price), 1e-6)
+        prev_value = max(self.portfolio_value[-1], 1e-6)
+        reward = np.clip(np.log(new_value / prev_value), -10, 10)  # Clipped reward
+        self.portfolio_value.append(new_value)
+        
+        self.current_step += 1
+        done = self.current_step >= len(self.df) - 1
+        
+        return self._get_state(), reward, done, {}
+
+# ====================== RL Agent ======================
+class DQNAgent:
+    def __init__(self, input_dim, output_dim):
+        print("Initializing DQN agent...")
+        self.policy_net = DQN(input_dim, output_dim).to(Config.device)
+        self.target_net = DQN(input_dim, output_dim).to(Config.device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=Config.lr)
+        self.memory = deque(maxlen=Config.memory_size)
+        self.epsilon = Config.epsilon_start
+        self.loss_fn = nn.SmoothL1Loss()
+        print(f"Agent initialized on {Config.device}")
+        
+    def select_action(self, state):
+        if random.random() < self.epsilon:
+            return random.choice([0, 1])
+        with torch.no_grad():
+            return self.policy_net(state).argmax().item()
+    
+    def store_transition(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+    
+    def update_model(self):
+        if len(self.memory) < Config.batch_size:
+            return 0
+        
+        batch = random.sample(self.memory, Config.batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+        
+        states = torch.stack(states)
+        next_states = torch.stack(next_states)
+        actions = torch.LongTensor(actions).to(Config.device)
+        rewards = torch.FloatTensor(rewards).to(Config.device)
+        dones = torch.FloatTensor(dones).to(Config.device)
+        
+        current_q = self.policy_net(states).gather(1, actions.unsqueeze(1))
+        next_q = self.target_net(next_states).max(1)[0].detach()
+        target_q = rewards + (1 - dones) * Config.gamma * next_q
+        
+        loss = self.loss_fn(current_q.squeeze(), target_q)
         self.optimizer.zero_grad()
         loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(self.hyperagent.parameters(), 1)
+        nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=1.0)  # Changed to grad_norm
         self.optimizer.step()
-        for param, target_param in zip(self.hyperagent.parameters(), self.hyperagent_target.parameters()):
-            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-        self.update_counter += 1
-        return td_error.cpu(), memory_error.cpu(), KL_loss.cpu(), torch.mean(q_current.cpu()), torch.mean(q_target.cpu())
-
-    def act(self, state, state_trend, state_clf, info):
-        x1 = torch.FloatTensor(state).to(self.device)
-        x2 = torch.FloatTensor(state_trend).to(self.device)
-        x3 = torch.FloatTensor(state_clf).unsqueeze(0).to(self.device)
-        previous_action = torch.unsqueeze(
-            torch.tensor(info["previous_action"]).long().to(self.device),
-            0).to(self.device)
-        if np.random.uniform() < (1-self.epsilon):
-            qs = [
-                    self.slope_agents[0](x1, x2, previous_action),
-                    self.slope_agents[1](x1, x2, previous_action),
-                    self.slope_agents[2](x1, x2, previous_action),
-                    self.vol_agents[0](x1, x2, previous_action),
-                    self.vol_agents[1](x1, x2, previous_action),
-                    self.vol_agents[2](x1, x2, previous_action)
-            ]
-            w = self.hyperagent(x1, x2, x3, previous_action)
-            actions_value = self.calculate_q(w, qs)
-            action = torch.max(actions_value, 1)[1].data.cpu().numpy()
-            action = action[0]
-        else:
-            action_choice = [0,1]
-            action = random.choice(action_choice)
-        return action
-
-    def act_test(self, state, state_trend, state_clf, info):
-        with torch.no_grad():
-            x1 = torch.FloatTensor(state).to(self.device)
-            x2 = torch.FloatTensor(state_trend).to(self.device)
-            x3 = torch.FloatTensor(state_clf).unsqueeze(0).to(self.device)
-            previous_action = torch.unsqueeze(
-                torch.tensor(info["previous_action"]).long().to(self.device),
-                0).to(self.device)
-            qs = [
-                    self.slope_agents[0](x1, x2, previous_action),
-                    self.slope_agents[1](x1, x2, previous_action),
-                    self.slope_agents[2](x1, x2, previous_action),
-                    self.vol_agents[0](x1, x2, previous_action),
-                    self.vol_agents[1](x1, x2, previous_action),
-                    self.vol_agents[2](x1, x2, previous_action)
-            ]
-            w = self.hyperagent(x1, x2, x3, previous_action)
-            actions_value = self.calculate_q(w, qs)
-            action = torch.max(actions_value, 1)[1].data.cpu().numpy()
-            action = action[0]
-            return action
-
-    def q_estimate(self, state, state_trend, state_clf, info):
-        x1 = torch.FloatTensor(state).to(self.device)
-        x2 = torch.FloatTensor(state_trend).to(self.device)
-        x3 = torch.FloatTensor(state_clf).unsqueeze(0).to(self.device)
-        previous_action = torch.unsqueeze(
-            torch.tensor(info["previous_action"]).long().to(self.device),
-            0).to(self.device)
-        qs = [
-                self.slope_agents[0](x1, x2, previous_action),
-                self.slope_agents[1](x1, x2, previous_action),
-                self.slope_agents[2](x1, x2, previous_action),
-                self.vol_agents[0](x1, x2, previous_action),
-                self.vol_agents[1](x1, x2, previous_action),
-                self.vol_agents[2](x1, x2, previous_action)
-        ]
-        w = self.hyperagent(x1, x2, x3, previous_action)
-        actions_value = self.calculate_q(w, qs)
-        q = torch.max(actions_value, 1)[0].detach().cpu().numpy()
         
-        return q
+        self.epsilon = max(Config.epsilon_end, 
+                         self.epsilon * Config.epsilon_decay)
+        return loss.item()
+    
+    def update_target(self):
+        self.target_net.load_state_dict(self.policy_net.state_dict())
 
-    def calculate_hidden(self, state, state_trend, info):
-        x1 = torch.FloatTensor(state).to(self.device)
-        x2 = torch.FloatTensor(state_trend).to(self.device)
-        previous_action = torch.unsqueeze(
-            torch.tensor(info["previous_action"]).long().to(self.device),
-            0).to(self.device)
-        with torch.no_grad():
-            hs = self.hyperagent.encode(x1, x2, previous_action).cpu().numpy()
-        return hs
-
-
-    def train(self):
-        epoch_return_rate_train_list = []
-        epoch_final_balance_train_list = []
-        epoch_required_money_train_list = []
-        epoch_reward_sum_train_list = []
-        step_counter = 0
-        episode_counter = 0
-        epoch_counter = 0
-        best_return_rate = -float('inf')
-        best_model = None
-        self.replay_buffer = ReplayBuffer_High(args, self.n_state_1, self.n_state_2, self.n_action) 
-        for sample in range(self.epoch_number):
-            print('epoch ', epoch_counter + 1)
-            self.df = pd.read_feather(
-                os.path.join(self.train_data_path, "train.feather"))
+# ====================== Training Loop ======================
+def train():
+    # Clean previous runs
+    for f in ['best_model.pth', 'interrupted_model.pth', 'training_results.png']:
+        if os.path.exists(f):
+            os.remove(f)
+    
+    print("="*50)
+    print("Starting training process...")
+    print(f"Current time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("="*50 + "\n")
+    
+    try:
+        # Load and limit data
+        print("Loading training data...")
+        train_df = pd.read_csv(Config.train_path)
+        val_df = pd.read_csv(Config.val_path)
+        
+        if Config.max_train_rows:
+            train_df = train_df.iloc[:Config.max_train_rows]
+        if Config.max_val_rows:
+            val_df = val_df.iloc[:Config.max_val_rows]
             
-            
-            train_env = Training_Env(
-                    df=self.df,
-                    tech_indicator_list=self.tech_indicator_list,
-                    tech_indicator_list_trend=self.tech_indicator_list_trend,
-                    clf_list=self.clf_list,
-                    transcation_cost=self.transcation_cost,
-                    back_time_length=self.back_time_length,
-                    max_holding_number=self.max_holding_number,
-                    initial_action=random.choices(range(self.n_action), k=1)[0],
-                    alpha = 0)
-            s, s2, s3, info = train_env.reset()
-            episode_reward_sum = 0
-            
-            while True:
-                a = self.act(s, s2, s3, info)
-                s_, s2_, s3_, r, done, info_ = train_env.step(a)
-                hs = self.calculate_hidden(s, s2, info)
-                q = r + self.gamma * (1 - done) * self.q_estimate(s_, s2_, s3_, info_)
-                q_memory = self.memory.query(hs, a)
-                if np.isnan(q_memory):
-                    q_memory = q
-                self.replay_buffer.store_transition(s, s2, s3, info['previous_action'], info['q_value'], a, r, s_, s2_, s3_, info_['previous_action'],
-                                info_['q_value'], done, q_memory)
-                self.memory.add(hs, a, q, s, s2, info['previous_action'])
-                episode_reward_sum += r
-
-                s, s2, s3, info = s_, s2_, s3_, info_
-                step_counter += 1
-                if step_counter % self.eval_update_freq == 0 and step_counter > (
-                        self.batch_size + self.n_step):
-                    for i in range(self.update_times):
-                        td_error, memory_error, KL_loss, q_eval, q_target = self.update(self.replay_buffer)
-                        if self.update_counter % self.q_value_memorize_freq == 1:
-                            self.writer.add_scalar(
-                                tag="td_error",
-                                scalar_value=td_error,
-                                global_step=self.update_counter,
-                                walltime=None)
-                            self.writer.add_scalar(
-                                tag="memory_error",
-                                scalar_value=memory_error,
-                                global_step=self.update_counter,
-                                walltime=None)
-                            self.writer.add_scalar(
-                                tag="KL_loss",
-                                scalar_value=KL_loss,
-                                global_step=self.update_counter,
-                                walltime=None)
-                            self.writer.add_scalar(
-                                tag="q_eval",
-                                scalar_value=q_eval,
-                                global_step=self.update_counter,
-                                walltime=None)
-                            self.writer.add_scalar(
-                                tag="q_target",
-                                scalar_value=q_target,
-                                global_step=self.update_counter,
-                                walltime=None)
-                    if step_counter > 4320:
-                        self.memory.re_encode(self.hyperagent)
-                if done:
-                    break
-            episode_counter += 1
-            final_balance, required_money = train_env.final_balance, train_env.required_money
-            self.writer.add_scalar(tag="return_rate_train",
-                                scalar_value=final_balance / (required_money),
-                                global_step=episode_counter,
-                                walltime=None)
-            self.writer.add_scalar(tag="final_balance_train",
-                                scalar_value=final_balance,
-                                global_step=episode_counter,
-                                walltime=None)
-            self.writer.add_scalar(tag="required_money_train",
-                                scalar_value=required_money,
-                                global_step=episode_counter,
-                                walltime=None)
-            self.writer.add_scalar(tag="reward_sum_train",
-                                scalar_value=episode_reward_sum,
-                                global_step=episode_counter,
-                                walltime=None)
-            epoch_return_rate_train_list.append(final_balance / (required_money))
-            epoch_final_balance_train_list.append(final_balance)
-            epoch_required_money_train_list.append(required_money)
-            epoch_reward_sum_train_list.append(episode_reward_sum)
+        print(f"Using LIMITED dataset: Train {len(train_df)} rows, Val {len(val_df)} rows")
+        print("\nTraining data sample:")
+        print(train_df.head(2))
+        
+        # Initialize components
+        print("\nInitializing environment and agent...")
+        env = TradingEnv(train_df)
+        agent = DQNAgent(input_dim=len(Config.tech_indicators), output_dim=2)
+        
+        best_val_return = -np.inf
+        returns = []
+        losses = []
+        
+        print("\n" + "="*50)
+        print("Beginning training loop...")
+        print(f"Total episodes: {Config.num_episodes}")
+        print("="*50 + "\n")
+        
+        for episode in range(Config.num_episodes):
+            try:
+                state = env.reset()
+                done = False
+                total_reward = 0
+                episode_loss = 0
+                update_count = 0
                 
-
-            epoch_counter += 1
-            self.epsilon = self.epsilon_scheduler.get_epsilon(epoch_counter)
-            mean_return_rate_train = np.mean(epoch_return_rate_train_list)
-            mean_final_balance_train = np.mean(epoch_final_balance_train_list)
-            mean_required_money_train = np.mean(epoch_required_money_train_list)
-            mean_reward_sum_train = np.mean(epoch_reward_sum_train_list)
-            self.writer.add_scalar(
-                    tag="epoch_return_rate_train",
-                    scalar_value=mean_return_rate_train,
-                    global_step=epoch_counter,
-                    walltime=None,
-                )
-            self.writer.add_scalar(
-                tag="epoch_final_balance_train",
-                scalar_value=mean_final_balance_train,
-                global_step=epoch_counter,
-                walltime=None,
-                )
-            self.writer.add_scalar(
-                tag="epoch_required_money_train",
-                scalar_value=mean_required_money_train,
-                global_step=epoch_counter,
-                walltime=None,
-                )
-            self.writer.add_scalar(
-                tag="epoch_reward_sum_train",
-                scalar_value=mean_reward_sum_train,
-                global_step=epoch_counter,
-                walltime=None,
-                )
-            epoch_path = os.path.join(self.model_path,
-                                        "epoch_{}".format(epoch_counter))
-            if not os.path.exists(epoch_path):
-                os.makedirs(epoch_path)
-            torch.save(self.hyperagent.state_dict(),
-                        os.path.join(epoch_path, "trained_model.pkl"))  
-            val_path = os.path.join(epoch_path, "val")
-            if not os.path.exists(val_path):
-                    os.makedirs(val_path)
-            return_rate_eval = self.val_cluster(epoch_path, val_path)
-            if return_rate_eval > best_return_rate:
-                best_return_rate = return_rate_eval
-                best_model = self.hyperagent.state_dict()
-            epoch_return_rate_train_list = []
-            epoch_final_balance_train_list = []
-            epoch_required_money_train_list = []
-            epoch_reward_sum_train_list = []
-        best_model_path = os.path.join("./result/high_level", 
-                                        '{}'.format(self.dataset), 'best_model.pkl')
-        torch.save(best_model.state_dict(), best_model_path)
-        final_result_path = os.path.join("./result/high_level", '{}'.format(self.dataset))
-        self.test_cluster(best_model_path, final_result_path)
-
-
-    def val_cluster(self, epoch_path, save_path):
-        self.hyperagent.load_state_dict(
-            torch.load(os.path.join(epoch_path, "trained_model.pkl")))
-        self.hyperagent.eval()
-        counter = False
-        action_list = []
-        reward_list = []
-        final_balance_list = []
-        required_money_list = []
-        commission_fee_list = []
-        self.df = pd.read_feather(
-            os.path.join(self.val_data_path, "val.feather"))
+                while not done:
+                    action = agent.select_action(state)
+                    next_state, reward, done, _ = env.step(action)
+                    agent.store_transition(state, action, reward, next_state, done)
+                    
+                    loss = agent.update_model()
+                    if loss > 0:
+                        episode_loss += loss
+                        update_count += 1
+                    
+                    state = next_state
+                    total_reward += reward
+                
+                avg_loss = episode_loss / max(update_count, 1)
+                
+                # Validation
+                val_env = TradingEnv(val_df)
+                val_state = val_env.reset()
+                val_done = False
+                val_return = 0
+                
+                with torch.no_grad():
+                    while not val_done:
+                        val_action = agent.policy_net(val_state).argmax().item()
+                        val_state, val_reward, val_done, _ = val_env.step(val_action)
+                        val_return += val_reward
+                
+                returns.append(val_return)
+                losses.append(avg_loss)
+                
+                if val_return > best_val_return:
+                    best_val_return = val_return
+                    torch.save(agent.policy_net.state_dict(), "best_model.pth")
+                
+                if episode % Config.target_update == 0:
+                    agent.update_target()
+                
+                print(f"Episode {episode+1:03d}/{Config.num_episodes} | "
+                      f"Train: {total_reward:+.2f} | "
+                      f"Val: {val_return:+.2f} | "
+                      f"ε: {agent.epsilon:.3f} | "
+                      f"Loss: {avg_loss:.4f} | "
+                      f"Steps: {env.current_step}")
+                
+            except KeyboardInterrupt:
+                print("\nTraining interrupted! Saving current model...")
+                torch.save(agent.policy_net.state_dict(), "interrupted_model.pth")
+                break
         
-        val_env = Testing_Env(
-                df=self.df,
-                tech_indicator_list=self.tech_indicator_list,
-                tech_indicator_list_trend=self.tech_indicator_list_trend,
-                clf_list=self.clf_list,
-                transcation_cost=self.transcation_cost,
-                back_time_length=self.back_time_length,
-                max_holding_number=self.max_holding_number,
-                initial_action=0)
-        s, s2, s3, info = val_env.reset()
-        done = False
-        action_list_episode = []
-        reward_list_episode = []
-        while not done:
-            a = self.act_test(s, s2, s3, info)
-            s_, s2_, s3_, r, done, info_ = val_env.step(a)
-            reward_list_episode.append(r)
-            s, s2, s3, info = s_, s2_, s3_, info_
-            action_list_episode.append(a)
-        portfit_magine, final_balance, required_money, commission_fee = val_env.get_final_return_rate(
-            slient=True)
-        final_balance = val_env.final_balance
-        action_list.append(action_list_episode)
-        reward_list.append(reward_list_episode)
-        final_balance_list.append(final_balance)
-        required_money_list.append(required_money)
-        commission_fee_list.append(commission_fee)
-        action_list = np.array(action_list)
-        reward_list = np.array(reward_list)
-        final_balance_list = np.array(final_balance_list)
-        required_money_list = np.array(required_money_list)
-        commission_fee_list = np.array(commission_fee_list)
-        np.save(os.path.join(save_path, "action_val.npy"), action_list)
-        np.save(os.path.join(save_path, "reward_val.npy"), reward_list)
-        np.save(os.path.join(save_path, "final_balance_val.npy"),
-            final_balance_list)
-        np.save(os.path.join(save_path, "require_money_val.npy"),
-                required_money_list)
-        np.save(os.path.join(save_path, "commission_fee_history_val.npy"),
-                commission_fee_list)
-        return_rate = final_balance / required_money
-        return return_rate
-
-    def test_cluster(self, epoch_path, save_path):
-        self.hyperagent.load_state_dict(
-            torch.load(os.path.join(epoch_path, "trained_model.pkl")))
-        self.hyperagent.eval()
-        counter = False
-        action_list = []
-        reward_list = []
-        final_balance_list = []
-        required_money_list = []
-        commission_fee_list = []
-        self.df = pd.read_feather(
-            os.path.join(self.test_data_path, "test.feather"))
+        # Training complete
+        print("\n" + "="*50)
+        print("Training completed!")
+        print(f"Best validation return: {best_val_return:.2f}")
+        print(f"Final epsilon: {agent.epsilon:.3f}")
+        print("="*50 + "\n")
         
-        test_env = Testing_Env(
-                df=self.df,
-                tech_indicator_list=self.tech_indicator_list,
-                tech_indicator_list_trend=self.tech_indicator_list_trend,
-                clf_list=self.clf_list,
-                transcation_cost=self.transcation_cost,
-                back_time_length=self.back_time_length,
-                max_holding_number=self.max_holding_number,
-                initial_action=0)
-        s, s2, s3, info = test_env.reset()
-        done = False
-        action_list_episode = []
-        reward_list_episode = []
-        while not done:
-            a = self.act_test(s, s2, s3, info)
-            s_, s2_, s3_, r, done, info_ = test_env.step(a)
-            reward_list_episode.append(r)
-            s, s2, s3, info = s_, s2_, s3_, info_
-            action_list_episode.append(a)
-        portfit_magine, final_balance, required_money, commission_fee = test_env.get_final_return_rate(
-            slient=True)
-        final_balance = test_env.final_balance
-        action_list.append(action_list_episode)
-        reward_list.append(reward_list_episode)
-        final_balance_list.append(final_balance)
-        required_money_list.append(required_money)
-        commission_fee_list.append(commission_fee)
-
-        action_list = np.array(action_list)
-        reward_list = np.array(reward_list)
-        final_balance_list = np.array(final_balance_list)
-        required_money_list = np.array(required_money_list)
-        commission_fee_list = np.array(commission_fee_list)
-        np.save(os.path.join(save_path, "action.npy"), action_list)
-        np.save(os.path.join(save_path, "reward.npy"), reward_list)
-        np.save(os.path.join(save_path, "final_balance.npy"),
-            final_balance_list)
-        np.save(os.path.join(save_path, "require_money.npy"),
-                required_money_list)
-        np.save(os.path.join(save_path, "commission_fee_history.npy"),
-                commission_fee_list)
-            
-
+        # Plot results
+        plt.figure(figsize=(12, 5))
+        plt.subplot(1, 2, 1)
+        plt.plot(returns)
+        plt.title("Validation Returns")
+        plt.xlabel("Episode")
+        plt.ylabel("Return")
+        plt.grid()
+        
+        plt.subplot(1, 2, 2)
+        plt.plot(losses)
+        plt.title("Training Loss")
+        plt.xlabel("Episode")
+        plt.ylabel("Loss")
+        plt.grid()
+        
+        plt.tight_layout()
+        plt.savefig("training_results.png")
+        plt.show()
+        
+    except Exception as e:
+        print(f"\n❌ Critical error: {str(e)}")
+        if 'agent' in locals():
+            torch.save(agent.policy_net.state_dict(), "error_model.pth")
+        raise
 
 if __name__ == "__main__":
-    args = parser.parse_args()
-    print(args)
-    agent = DQN(args)
-    agent.train()
+    train()
