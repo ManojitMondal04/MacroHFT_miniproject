@@ -212,7 +212,7 @@ def train():
     plt.savefig("training_results.png")
     plt.close()
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     print(f"Starting CPU-optimized training at {datetime.now().strftime('%H:%M:%S')}")
     train()
     print(f"Training completed at {datetime.now().strftime('%H:%M:%S')}")
