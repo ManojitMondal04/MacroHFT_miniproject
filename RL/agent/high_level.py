@@ -26,7 +26,7 @@ class Config:
     epsilon_decay = 0.995
     target_update = 10
     memory_size = 10000
-    num_episodes = 150
+    num_episodes = 500
     
     # Data paths
     train_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_train.csv"
