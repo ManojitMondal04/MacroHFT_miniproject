@@ -29,7 +29,7 @@ class Config:
     num_episodes = 500
     
     # Corrected local data paths using raw strings and consistent backslashes
-    base_path = r"C:\Users\KIIT\OneDrive\Desktop\MacroHFT"
+    base_path = r"C:\Users\KIIT\OneDrive\Desktop\MacroHFT\MacroHFT_miniproject"
     train_path = os.path.join(base_path, "datasets", "df_train.csv")
     val_path = os.path.join(base_path, "datasets", "df_validate.csv")
     test_path = os.path.join(base_path, "datasets", "df_test.csv")
