@@ -28,10 +28,11 @@ class Config:
     memory_size = 10000
     num_episodes = 500
     
-    # Data paths
-    train_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_train.csv"
-    val_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_validate.csv"
-    test_path = "/content/drive/MyDrive/MacroHFT/data/ETHUSDT/whole/df_test.csv"
+    # Corrected local data paths using raw strings and consistent backslashes
+    base_path = r"C:\Users\KIIT\OneDrive\Desktop\MacroHFT"
+    train_path = os.path.join(base_path, "datasets", "df_train.csv")
+    val_path = os.path.join(base_path, "datasets", "df_validate.csv")
+    test_path = os.path.join(base_path, "datasets", "df_test.csv")
     
     # Dataset limitation (set to None for full dataset)
     max_train_rows = 10000  # Reduced dataset size for testing
@@ -194,6 +195,9 @@ def train():
         print(train_df.head(2))
     except Exception as e:
         print(f"❌ Error loading data: {str(e)}")
+        print("Please ensure:")
+        print(f"1. Files exist at: {Config.train_path} and {Config.val_path}")
+        print("2. The paths are correct and accessible")
         return
     
     # Initialize components
@@ -288,5 +292,80 @@ def train():
     plt.savefig("training_results.png")
     plt.show()
 
+# ====================== Prediction Function ======================
+def predict(model_path="best_model.pth", test_data_path=None):
+    """Make predictions using the trained model"""
+    print("\n" + "="*50)
+    print("Starting prediction...")
+    
+    # Load test data
+    test_path = test_data_path if test_data_path else Config.test_path
+    try:
+        test_df = pd.read_csv(test_path)
+        print(f"Loaded test data with {len(test_df)} rows")
+    except Exception as e:
+        print(f"❌ Error loading test data: {str(e)}")
+        return None
+    
+    # Initialize environment
+    env = TradingEnv(test_df)
+    
+    # Load trained model
+    agent = DQNAgent(input_dim=len(Config.tech_indicators), output_dim=2)
+    agent.policy_net.load_state_dict(torch.load(model_path))
+    agent.policy_net.eval()
+    
+    # Run prediction
+    state = env.reset()
+    done = False
+    actions = []
+    portfolio_values = []
+    
+    with torch.no_grad():
+        while not done:
+            action = agent.policy_net(state).argmax().item()
+            actions.append(action)
+            state, _, done, _ = env.step(action)
+            portfolio_values.append(env.portfolio_value[-1])
+    
+    # Create results dataframe
+    results = test_df.iloc[:len(actions)].copy()
+    results['Action'] = actions
+    results['Portfolio_Value'] = portfolio_values
+    results['Daily_Return'] = results['Portfolio_Value'].pct_change()
+    
+    # Save predictions
+    os.makedirs('./results', exist_ok=True)
+    results.to_csv('./results/predictions.csv', index=False)
+    print("Predictions saved to ./results/predictions.csv")
+    
+    # Plot results
+    plt.figure(figsize=(15, 8))
+    plt.subplot(2, 1, 1)
+    plt.plot(results['Close'], label='Price')
+    plt.scatter(results.index[results['Action'] == 1], 
+                results['Close'][results['Action'] == 1], 
+                color='green', label='Buy', marker='^')
+    plt.scatter(results.index[results['Action'] == 0], 
+                results['Close'][results['Action'] == 0], 
+                color='red', label='Sell', marker='v')
+    plt.title('Trading Signals')
+    plt.legend()
+    
+    plt.subplot(2, 1, 2)
+    plt.plot(results['Portfolio_Value'], label='Portfolio Value')
+    plt.title('Portfolio Performance')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig('./results/prediction_results.png')
+    plt.show()
+    
+    return results
+
 if __name__ == "__main__":
+    # First train the model
     train()
+    
+    # Then make predictions
+    predict()
